@@ -60,7 +60,7 @@ add_library(teakra
 
 create_target_directory_groups(teakra)
 
-target_link_libraries(teakra PRIVATE Threads::Threads boost tsl::robin_map xbyak::xbyak)
+target_link_libraries(teakra PRIVATE Threads::Threads tsl::robin_map xbyak::xbyak)
 target_include_directories(teakra
                            PUBLIC ../include
                            PRIVATE .)

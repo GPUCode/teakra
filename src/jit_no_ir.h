@@ -81,6 +81,36 @@ public:
         u16 pad{};
     };
 
+    enum class KeyPart : u32 {
+        Mod1,
+        Mod0,
+        Mod2,
+        Arp0, Arp1, Arp2, Arp3,
+        Ar0, Ar1, Pad0,
+        Mod1b,
+        Mod0b,
+        Mod2b,
+        Arp0b, Arp1b, Arp2b, Arp3b,
+        Ar0b, Ar1b, Pad1,
+        Cfgi, Cfgj,
+        Stepi0, Stepj0,
+        Cfgib, Cfgjb,
+        Stepi0b, Stepj0b,
+    };
+
+    union KeyMask {
+        std::array<u16, 32> words{};
+        std::array<u64, 8> qwords;
+
+        void Mask(KeyPart part) {
+            Mask(static_cast<u32>(part));
+        }
+
+        void Mask(u32 part) {
+            words[part] = std::numeric_limits<u16>::max();
+        }
+    };
+
     struct BlockKey {
         BlockSwapState curr{};
         BlockSwapState shadow{};
@@ -88,25 +118,97 @@ public:
         u16 stepi0, stepj0;
         Cfg cfgib, cfgjb;
         u16 stepi0b, stepj0b;
-        u32 pc;
-        u32 pad;
+        u64 pad{};
 
-        FORCE_INLINE bool operator==(const BlockKey& other) const {
-            return std::memcmp(this, &other, sizeof(BlockKey)) == 0;
+        KeyMask* mask;
+
+        void SetMask(KeyMask* mask_) {
+            mask = mask_;
+        }
+
+        void MaskAllCntx() {
+            for (u32 i = static_cast<u32>(KeyPart::Mod1); i <= static_cast<u32>(KeyPart::Ar1); i++) {
+                mask->Mask(i);
+            }
+            for (u32 i = static_cast<u32>(KeyPart::Mod1b); i <= static_cast<u32>(KeyPart::Ar1b); i++) {
+                mask->Mask(i);
+            }
+        }
+
+        template <bool is_shadow = false>
+        Mod0& GetMod0() {
+            mask->Mask(is_shadow ? KeyPart::Mod0b : KeyPart::Mod0);
+            return is_shadow ? shadow.mod0 : curr.mod0;
+        }
+
+        template <bool is_shadow = false>
+        Mod1& GetMod1() {
+            mask->Mask(is_shadow ? KeyPart::Mod1b : KeyPart::Mod1);
+            return is_shadow ? shadow.mod1 : curr.mod1;
+        }
+
+        template <bool is_shadow = false>
+        Mod2& GetMod2() {
+            mask->Mask(is_shadow ? KeyPart::Mod2b : KeyPart::Mod2);
+            return is_shadow ? shadow.mod2 : curr.mod2;
+        }
+
+        template <bool is_shadow = false>
+        ArU& GetAr(u32 i) {
+            mask->Mask(is_shadow ? static_cast<u32>(KeyPart::Ar0) + i : static_cast<u32>(KeyPart::Ar0b) + i);
+            return is_shadow ? shadow.ar[i] : curr.ar[i];
+        }
+
+        template <bool is_shadow = false>
+        ArpU& GetArp(u32 i) {
+            mask->Mask(is_shadow ? static_cast<u32>(KeyPart::Arp0) + i : static_cast<u32>(KeyPart::Arp0b) + i);
+            return is_shadow ? shadow.arp[i] : curr.arp[i];
+        }
+
+        template <bool is_bank = false>
+        Cfg& GetCfgi() {
+            mask->Mask(is_bank ? KeyPart::Cfgib : KeyPart::Cfgi);
+            return is_bank ? cfgib : cfgi;
+        }
+
+        template <bool is_bank = false>
+        Cfg& GetCfgj() {
+            mask->Mask(is_bank ? KeyPart::Cfgjb : KeyPart::Cfgj);
+            return is_bank ? cfgjb : cfgj;
+        }
+
+        template <bool is_bank = false>
+        u16& GetStepi0() {
+            mask->Mask(is_bank ? KeyPart::Stepi0b : KeyPart::Stepi0);
+            return is_bank ? stepi0b : stepi0;
+        }
+
+        template <bool is_bank = false>
+        u16& GetStepj0() {
+            mask->Mask(is_bank ? KeyPart::Stepj0b : KeyPart::Stepj0);
+            return is_bank ? stepj0b : stepj0;
         }
     };
 
-    static_assert(sizeof(BlockKey) == 64);
+    static_assert(offsetof(BlockKey, mask) == 64);
 
-    struct Block {
+    struct LocationDescriptor {
+        KeyMask mask;
+        BlockKey key{};
         BlockFunc func;
         s32 cycles;
-    };
 
-    enum JitStatus {
-        Compiling = 0,
-        EndStaticJump = 1,
-        EndDynJump = 2,
+        bool Matches(const BlockKey& other) {
+            const u64* lhsp = (const u64*)&key;
+            const u64* rhsp = (const u64*)&other;
+            return (lhsp[0] == (rhsp[0] & mask.qwords[0])) &&
+                   (lhsp[1] == (rhsp[1] & mask.qwords[1])) &&
+                   (lhsp[2] == (rhsp[2] & mask.qwords[2])) &&
+                   (lhsp[3] == (rhsp[3] & mask.qwords[3])) &&
+                   (lhsp[4] == (rhsp[4] & mask.qwords[4])) &&
+                   (lhsp[5] == (rhsp[5] & mask.qwords[5])) &&
+                   (lhsp[6] == (rhsp[6] & mask.qwords[6]));
+        }
     };
 
     CoreTiming& core_timing;
@@ -119,12 +221,11 @@ public:
     std::set<u32> bkrep_end_locations;
     std::set<u32> rep_end_locations;
     bool compiling = false;
-    JitStatus status = JitStatus::Compiling;
-    using BlockList = std::vector<std::pair<BlockKey, Block>>;
+    using BlockList = std::vector<LocationDescriptor>;
     std::unique_ptr<BlockList[]> block_cache;
     std::stack<u32> call_stack;
-    Block* current_blk{};
-    BlockKey blk_key{};
+    LocationDescriptor* current_blk{};
+    BlockKey block_key{};
     bool unimplemented = false;
 
     void Reset() {
@@ -183,15 +284,13 @@ public:
         }
 
         // State for bank exchange.
-        blk_key.pc = regs.pc;
-        std::memcpy(&blk_key.cfgi, &regs.cfgi, sizeof(u16) * 8);
+        std::memcpy(&block_key.cfgi, &regs.cfgi, sizeof(u16) * 8);
         // Current state
-        std::memcpy(&blk_key.curr.mod1, &regs.mod1, sizeof(u16) * 3);
-        std::memcpy(&blk_key.curr.arp, &regs.arp, sizeof(regs.arp) + sizeof(regs.ar));
+        std::memcpy(&block_key.curr.mod1, &regs.mod1, sizeof(u16) * 3);
+        std::memcpy(&block_key.curr.arp, &regs.arp, sizeof(regs.arp) + sizeof(regs.ar));
         // Shadow state.
-        std::memcpy(&blk_key.shadow.mod1, &regs.mod1b, sizeof(u16) * 3);
-        std::memcpy(&blk_key.shadow.arp, &regs.arpb, sizeof(regs.arpb) + sizeof(regs.arb));
-
+        std::memcpy(&block_key.shadow.mod1, &regs.mod1b, sizeof(u16) * 3);
+        std::memcpy(&block_key.shadow.arp, &regs.arpb, sizeof(regs.arpb) + sizeof(regs.arb));
         LookupBlock();
 
         // Check if we are idle, and skip ahead
@@ -228,17 +327,17 @@ public:
 
     FORCE_INLINE void LookupBlock() {
         auto& vec = block_cache[regs.pc];
-        for (auto& [key, block] : vec) {
-            if (key == blk_key) {
-                current_blk = &block;
+        for (auto& desc : vec) {
+            if (desc.Matches(block_key)) {
+                current_blk = &desc;
                 return;
             }
         }
 
-        auto& [key, blk] = vec.emplace_back();
-        key = blk_key;
-        current_blk = &blk;
-        CompileBlock(blk);
+        auto& desc = vec.emplace_back();
+        desc.key = block_key;
+        current_blk = &desc;
+        CompileBlock();
         //printf("Compiling block at 0x%x with size = %d\n", blk_key.pc, blk.cycles);
     }
 
@@ -276,9 +375,9 @@ public:
         cycles_remaining -= current_blk->cycles;
     }
 
-    void CompileBlock(Block& blk) {
+    void CompileBlock() {
         // Load block state
-        blk.func = c.getCurr<BlockFunc>();
+        current_blk->func = c.getCurr<BlockFunc>();
         c.mov(REGS, ABI_PARAM1);
         c.mov(R0_1_2_3, qword[REGS + offsetof(JitRegisters, r)]);
         c.mov(R4_5_6_7, qword[REGS + offsetof(JitRegisters, r) + sizeof(u16) * 4]);
@@ -290,6 +389,7 @@ public:
         c.mov(FLAGS, word[REGS + offsetof(JitRegisters, flags)]);
 
         call_stack = {};
+        block_key.SetMask(&current_blk->mask);
 
         //Disassembler::ArArpSettings settings;
         //std::memcpy(&settings.ar, &blk_key.curr.ar, sizeof(settings.ar));
@@ -306,7 +406,7 @@ public:
             }
 
             decoder.call(*this, opcode, expand_value);
-            blk.cycles++;
+            current_blk->cycles++;
 
             if (rep_end_locations.contains(current_pc)) {
                 Xbyak::Label end_label, jump_back_label;
@@ -328,6 +428,12 @@ public:
 
             //const auto name = Disassembler::Do(opcode, expand_value, settings);
             //printf("%s\n", name.c_str());
+        }
+
+        // Mask entry key with generated mask.
+        u64* key = reinterpret_cast<u64*>(&current_blk->key);
+        for (u32 i = 0; i < current_blk->mask.qwords.size(); i++) {
+            key[i] &= current_blk->mask.qwords[i];
         }
 
         // Flush block state
@@ -657,10 +763,6 @@ public:
         }
     }
 
-    void LoadFromMemory(Reg64 out, MemImm8 addr) {
-        LoadFromMemory(out, addr.Unsigned16() + (blk_key.curr.mod1.page << 8));
-    }
-
     template <typename T>
     void LoadFromMemory(Reg64 out, T addr) {
         // TODO: Non MMIO reads can be performed inside the JIT.
@@ -774,9 +876,10 @@ public:
             c.movzx(y, x.cvt16());
             c.shr(x.cvt64(), 32);
         }
-        if (blk_key.curr.mod0.hwm == 1 || (blk_key.curr.mod0.hwm == 3 && unit == 0)) {
+        const auto mod0 = block_key.GetMod0();
+        if (mod0.hwm == 1 || (mod0.hwm == 3 && unit == 0)) {
             c.shr(y, 8);
-        } else if (blk_key.curr.mod0.hwm == 2 || (blk_key.curr.mod0.hwm == 3 && unit == 1)) {
+        } else if (mod0.hwm == 2 || (mod0.hwm == 3 && unit == 1)) {
             c.and_(y, 0xFF);
         }
         if (x_sign) {
@@ -937,7 +1040,7 @@ public:
     void alm(Alm op, MemImm8 a, Ax b) {
         const Reg64 value = rbx;
         const Reg64 address = rcx;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         ExtendOperandForAlm(op.GetName(), value);
         AlmGeneric(op.GetName(), value, b);
@@ -1255,12 +1358,12 @@ public:
     void alb(Alb op, Imm16 a, MemImm8 b) {
         const Reg64 bv = rax;
         const Reg64 address = rbx;
-        c.mov(address, b.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, b.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(bv, address);
         const Reg64 result = rbx;
         GenericAlb(op, a.Unsigned16(), bv.cvt16(), result.cvt16());
         if (IsAlbModifying(op)) {
-            StoreToMemory(b.Unsigned16() + (blk_key.curr.mod1.page << 8), result);
+            StoreToMemory(b.Unsigned16() + (block_key.GetMod1().page << 8), result);
         }
     }
     void alb(Alb op, Imm16 a, Rn b, StepZIDS bs) {
@@ -1345,13 +1448,13 @@ public:
             u16 bv;
             switch (b.GetName()) {
             case RegName::mod0:
-                bv = blk_key.curr.mod0.raw;
+                bv = block_key.GetMod0().raw;
                 break;
             case RegName::mod1:
-                bv = blk_key.curr.mod1.raw;
+                bv = block_key.GetMod1().raw;
                 break;
             case RegName::mod2:
-                bv = blk_key.curr.mod2.raw;
+                bv = block_key.GetMod2().raw;
                 break;
             default:
                 UNREACHABLE();
@@ -1505,10 +1608,11 @@ public:
         const Reg64 original_sign = rbx;
         c.mov(original_sign, value);
         c.shr(original_sign, 39);
+        const auto mod0 = block_key.GetMod0();
         if ((sv >> 15) == 0) {
             // left shift
             if (sv >= 40) {
-                if (blk_key.curr.mod0.s == 0) {
+                if (mod0.s == 0) {
                     // regs.fv = value != 0;
                     c.and_(FLAGS, ~decltype(Flags::fv)::mask); // clear fv
                     c.test(value, value);
@@ -1527,7 +1631,7 @@ public:
                 c.xor_(value.cvt32(), value.cvt32()); // value = 0;
                 c.and_(FLAGS, ~decltype(Flags::fc0)::mask); // regs.fc0 = 0;
             } else {
-                if (blk_key.curr.mod0.s == 0) {
+                if (mod0.s == 0) {
                     // TODO: This can probably be done better
                     c.mov(rdx, value);
                     c.mov(rcx, value);
@@ -1558,7 +1662,7 @@ public:
             // right shift
             u16 nsv = ~sv + 1;
             if (nsv >= 40) {
-                if (blk_key.curr.mod0.s == 0) {
+                if (mod0.s == 0) {
                     NOT_IMPLEMENTED();
                     // regs.fc0 = (value >> 39) & 1;
                     // value = regs.fc0 ? 0xFF'FFFF'FFFF : 0;
@@ -1574,20 +1678,19 @@ public:
                 c.shl(cx, decltype(Flags::fc0)::position); // mask <<= fc0_pos;
                 c.or_(FLAGS, cx);
                 c.shr(value, nsv); // value >>= nsv;
-                if (blk_key.curr.mod0.s == 0) {
+                if (mod0.s == 0) {
                     SignExtend(value, 40 - nsv);
                 }
             }
 
-            if (blk_key.curr.mod0.s == 0) {
+            if (mod0.s == 0) {
                 c.and_(FLAGS, ~decltype(Flags::fv)::mask); // regs.fv = 0;
             }
         }
 
         SignExtend(value, 40);
         SetAccFlag(value);
-        if (blk_key.curr.mod0.s == 0 && blk_key.curr.mod0.sata == 0) {
-
+        if (mod0.s == 0 && mod0.sata == 0) {
             Xbyak::Label end_label, saturate_label;
             c.bt(FLAGS, decltype(Flags::fv)::position);
             c.jc(saturate_label);
@@ -1620,7 +1723,8 @@ public:
         Xbyak::Label normal_shift, end_left_shift;
         c.cmp(sv, 40);
         c.jl(normal_shift);
-        if (blk_key.curr.mod0.s == 0) {
+        const auto mod0 = block_key.GetMod0();
+        if (mod0.s == 0) {
             // regs.fv = value != 0;
             c.and_(FLAGS, ~decltype(Flags::fv)::mask); // clear fv
             c.test(value, value);
@@ -1640,7 +1744,7 @@ public:
         c.and_(FLAGS, ~decltype(Flags::fc0)::mask); // regs.fc0 = 0;
         c.jmp(end_left_shift);
         c.L(normal_shift);
-        if (blk_key.curr.mod0.s == 0) {
+        if (mod0.s == 0) {
             // TODO: This can probably be done better
             // rdx = SignExtend(value, 40 - sv);
             c.mov(rdx, value);
@@ -1684,7 +1788,7 @@ public:
         Xbyak::Label normal_right_shift, end_right_shift;
         c.cmp(nsv, 40);
         c.jl(normal_right_shift);
-        if (blk_key.curr.mod0.s == 0) {
+        if (mod0.s == 0) {
             c.and_(FLAGS, ~decltype(Flags::fc0)::mask); // clear fc0
             c.xor_(esi, esi);
             c.bt(value, 39);
@@ -1711,7 +1815,7 @@ public:
         c.or_(FLAGS, si);
         c.add(nsv, 1);
         c.shr(value, nsv.cvt8()); // value >>= nsv;
-        if (blk_key.curr.mod0.s == 0) {
+        if (mod0.s == 0) {
             c.add(nsv, 24);
             c.shl(value, nsv.cvt8());
             c.sar(value, nsv.cvt8());
@@ -1719,14 +1823,14 @@ public:
         }
         c.L(end_right_shift);
 
-        if (blk_key.curr.mod0.s == 0) {
+        if (mod0.s == 0) {
             c.and_(FLAGS, ~decltype(Flags::fv)::mask); // regs.fv = 0;
         }
         c.L(end_label);
 
         SignExtend(value, 40);
         SetAccFlag(value);
-        if (blk_key.curr.mod0.s == 0 && blk_key.curr.mod0.sata == 0) {
+        if (mod0.s == 0 && mod0.sata == 0) {
             Xbyak::Label end_label, saturate_label;
             c.bt(FLAGS, decltype(Flags::fv)::position);
             c.jc(saturate_label);
@@ -1762,6 +1866,7 @@ public:
         c.pop(rax);
     }
 
+    template <bool update_flags = true>
     void AddSub(Reg64 a, Reg64 b, Reg64 result, bool sub) {
         c.mov(rsi, 0xFF'FFFF'FFFF);
         c.and_(a, rsi);
@@ -1772,29 +1877,31 @@ public:
         } else {
             c.add(result, b);
         }
-        c.and_(FLAGS, ~(decltype(Flags::fc0)::mask | decltype(Flags::fv)::mask)); // clear fc0, fv
-        c.xor_(esi, esi);
-        c.bt(result, 40);
-        c.setc(rsi.cvt8());
-        c.shl(rsi, decltype(Flags::fc0)::position);
-        c.or_(FLAGS, rsi.cvt16()); // regs.fc0 = (result >> 40) & 1;
-        if (sub) {
+        if constexpr (update_flags) {
+            c.and_(FLAGS, ~(decltype(Flags::fc0)::mask | decltype(Flags::fv)::mask)); // clear fc0, fv
+            c.xor_(esi, esi);
+            c.bt(result, 40);
+            c.setc(rsi.cvt8());
+            c.shl(rsi, decltype(Flags::fc0)::position);
+            c.or_(FLAGS, rsi.cvt16()); // regs.fc0 = (result >> 40) & 1;
+            if (sub) {
+                c.not_(b);
+            }
+            c.xor_(b, a);
             c.not_(b);
+            c.xor_(a, result);
+            c.and_(a, b);
+            c.bt(a, 39); // ((~(a ^ b) & (a ^ result)) >> 39) & 1;
+            c.setc(rsi.cvt8());
+            c.shl(rsi, decltype(Flags::fv)::position);
+            c.or_(FLAGS, rsi.cvt16());
+            // if (regs.fv) {
+            //     regs.fvl = 1;
+            // }
+            static_assert(decltype(Flags::fv)::position - decltype(Flags::fvl)::position == 3);
+            c.shr(rsi, 3);
+            c.or_(FLAGS, rsi.cvt16());
         }
-        c.xor_(b, a);
-        c.not_(b);
-        c.xor_(a, result);
-        c.and_(a, b);
-        c.bt(a, 39); // ((~(a ^ b) & (a ^ result)) >> 39) & 1;
-        c.setc(rsi.cvt8());
-        c.shl(rsi, decltype(Flags::fv)::position);
-        c.or_(FLAGS, rsi.cvt16());
-        // if (regs.fv) {
-        //     regs.fvl = 1;
-        // }
-        static_assert(decltype(Flags::fv)::position - decltype(Flags::fvl)::position == 3);
-        c.shr(rsi, 3);
-        c.or_(FLAGS, rsi.cvt16());
         SignExtend(result, 40);
     }
 
@@ -2097,13 +2204,13 @@ public:
 
     void banke(BankFlags flags) {
         if (flags.Cfgi()) {
-            c.mov(word[REGS + offsetof(JitRegisters, cfgi)], blk_key.cfgib.raw);
-            c.mov(word[REGS + offsetof(JitRegisters, cfgib)], blk_key.cfgi.raw);
-            std::swap(blk_key.cfgi, blk_key.cfgib);
-            if (blk_key.curr.mod1.stp16) {
-                c.mov(word[REGS + offsetof(JitRegisters, stepi0)], blk_key.stepi0b);
-                c.mov(word[REGS + offsetof(JitRegisters, stepi0b)], blk_key.stepi0);
-                std::swap(blk_key.stepi0, blk_key.stepi0b);
+            c.mov(word[REGS + offsetof(JitRegisters, cfgi)], block_key.GetCfgi<1>().raw);
+            c.mov(word[REGS + offsetof(JitRegisters, cfgib)], block_key.GetCfgi<0>().raw);
+            std::swap(block_key.cfgi, block_key.cfgib);
+            if (block_key.GetMod1().stp16) {
+                c.mov(word[REGS + offsetof(JitRegisters, stepi0)], block_key.GetStepi0<1>());
+                c.mov(word[REGS + offsetof(JitRegisters, stepi0b)], block_key.GetStepi0<0>());
+                std::swap(block_key.stepi0, block_key.stepi0b);
             }
         }
         if (flags.R4()) {
@@ -2123,13 +2230,13 @@ public:
             c.rorx(R4_5_6_7, R4_5_6_7, 16);
         }
         if (flags.Cfgj()) {
-            c.mov(word[REGS + offsetof(JitRegisters, cfgj)], blk_key.cfgjb.raw);
-            c.mov(word[REGS + offsetof(JitRegisters, cfgjb)], blk_key.cfgj.raw);
-            std::swap(blk_key.cfgj, blk_key.cfgjb);
-            if (blk_key.curr.mod1.stp16) {
-                c.mov(word[REGS + offsetof(JitRegisters, stepj0)], blk_key.stepj0b);
-                c.mov(word[REGS + offsetof(JitRegisters, stepj0b)], blk_key.stepj0);
-                std::swap(blk_key.stepj0, blk_key.stepj0b);
+            c.mov(word[REGS + offsetof(JitRegisters, cfgj)], block_key.GetCfgj<1>().raw);
+            c.mov(word[REGS + offsetof(JitRegisters, cfgjb)], block_key.GetCfgj<0>().raw);
+            std::swap(block_key.cfgj, block_key.cfgjb);
+            if (block_key.GetMod1().stp16) {
+                c.mov(word[REGS + offsetof(JitRegisters, stepj0)], block_key.GetStepj0<1>());
+                c.mov(word[REGS + offsetof(JitRegisters, stepj0b)], block_key.GetStepj0<0>());
+                std::swap(block_key.stepj0, block_key.stepj0b);
             }
         }
     }
@@ -2229,7 +2336,8 @@ public:
     void cntx_s() {
         regs.ShadowStore(c);
         regs.ShadowSwap(c);
-        std::swap(blk_key.curr, blk_key.shadow);
+        block_key.MaskAllCntx();
+        std::swap(block_key.curr, block_key.shadow);
         // if (!regs.crep) {
         //     regs.repcs = regs.repc;
         // }
@@ -2253,11 +2361,12 @@ public:
     void cntx_r() {
         regs.ShadowRestore(c);
         regs.ShadowSwap(c);
-        std::swap(blk_key.curr, blk_key.shadow);
+        block_key.MaskAllCntx();
+        std::swap(block_key.curr, block_key.shadow);
 
-               // if (!regs.crep) {
-               //     regs.repc = regs.repcs;
-               // }
+        // if (!regs.crep) {
+        //     regs.repc = regs.repcs;
+        // }
         c.mov(ax, word[REGS + offsetof(JitRegisters, repc)]);
         c.test(word[REGS + offsetof(JitRegisters, crep)], 0x1);
         c.cmovz(ax, word[REGS + offsetof(JitRegisters, repcs)]);
@@ -2341,7 +2450,7 @@ public:
         c.and_(ax, ~decltype(Mod0::ps0)::mask);
         c.or_(ax, mask);
         c.mov(word[REGS + offsetof(JitRegisters, mod0)], ax);
-        blk_key.curr.mod0.ps0.Assign(a.Unsigned16());
+        block_key.GetMod0().ps0.Assign(a.Unsigned16());
     }
     void load_stepi(Imm7s a) {
         // Although this is signed, we still only store the lower 7 bits
@@ -2350,7 +2459,7 @@ public:
         c.and_(ax, ~decltype(Cfg::step)::mask);
         c.or_(ax, stepi);
         c.mov(word[REGS + offsetof(JitRegisters, cfgi)], ax);
-        blk_key.cfgi.step.Assign(stepi);
+        block_key.GetCfgi().step.Assign(stepi);
     }
     void load_stepj(Imm7s a) {
         const u8 stepj = static_cast<u8>(a.Signed16() & 0x7F);
@@ -2358,26 +2467,26 @@ public:
         c.and_(ax, ~decltype(Cfg::step)::mask);
         c.or_(ax, stepj);
         c.mov(word[REGS + offsetof(JitRegisters, cfgj)], ax);
-        blk_key.cfgj.step.Assign(stepj);
+        block_key.GetCfgj().step.Assign(stepj);
     }
     void load_page(Imm8 a) {
         const u8 page = static_cast<u8>(a.Unsigned16());
         c.mov(byte[REGS + offsetof(JitRegisters, mod1)], page);
-        blk_key.curr.mod1.page.Assign(page);
+        block_key.GetMod1().page.Assign(page);
     }
     void load_modi(Imm9 a) {
         c.mov(ax, word[REGS + offsetof(JitRegisters, cfgi)]);
         c.and_(rax, ~decltype(Cfg::mod)::mask);
         c.or_(rax, a.Unsigned16() << decltype(Cfg::mod)::position);
         c.mov(word[REGS + offsetof(JitRegisters, cfgi)], ax);
-        blk_key.cfgi.mod.Assign(a.Unsigned16());
+        block_key.GetCfgi().mod.Assign(a.Unsigned16());
     }
     void load_modj(Imm9 a) {
         c.mov(ax, word[REGS + offsetof(JitRegisters, cfgj)]);
         c.and_(rax, ~decltype(Cfg::mod)::mask);
         c.or_(rax, a.Unsigned16() << decltype(Cfg::mod)::position);
         c.mov(word[REGS + offsetof(JitRegisters, cfgj)], ax);
-        blk_key.cfgj.mod.Assign(a.Unsigned16());
+        block_key.GetCfgj().mod.Assign(a.Unsigned16());
     }
     void load_movpd(Imm2 a) {
         c.mov(word[REGS + offsetof(JitRegisters, pcmhi)], a.Unsigned16());
@@ -2390,8 +2499,8 @@ public:
         c.and_(ax, ~(decltype(Mod0::ps0)::mask | decltype(Mod0::ps1)::mask));
         c.or_(ax, mask);
         c.mov(word[REGS + offsetof(JitRegisters, mod0)], ax);
-        blk_key.curr.mod0.ps0.Assign(ps0);
-        blk_key.curr.mod0.ps1.Assign(ps1);
+        block_key.GetMod0().ps0.Assign(ps0);
+        block_key.GetMod0().ps1.Assign(ps1);
     }
 
     void push(Imm16 a) {
@@ -2424,23 +2533,23 @@ public:
     std::optional<u16> IsArpArpSttModConst(ArArpSttMod a) {
         switch (a.GetName()) {
         case RegName::ar0:
-            return blk_key.curr.ar[0].raw;
+            return block_key.GetAr(0).raw;
         case RegName::ar1:
-            return blk_key.curr.ar[1].raw;
+            return block_key.GetAr(1).raw;
         case RegName::arp0:
-            return blk_key.curr.arp[0].raw;
+            return block_key.GetArp(0).raw;
         case RegName::arp1:
-            return blk_key.curr.arp[1].raw;
+            return block_key.GetArp(1).raw;
         case RegName::arp2:
-            return blk_key.curr.arp[2].raw;
+            return block_key.GetArp(2).raw;
         case RegName::arp3:
-            return blk_key.curr.arp[3].raw;
+            return block_key.GetArp(3).raw;
         case RegName::mod0:
-            return blk_key.curr.mod0.raw;
+            return block_key.GetMod0().raw;
         case RegName::mod1:
-            return blk_key.curr.mod1.raw;
+            return block_key.GetMod1().raw;
         case RegName::mod2:
-            return blk_key.curr.mod2.raw;
+            return block_key.GetMod2().raw;
         default:
             return std::nullopt;
         }
@@ -2705,7 +2814,7 @@ public:
     void tstb(MemImm8 a, Imm4 b) {
         const Reg64 value = rbx;
         const Reg64 address = rax;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         c.xor_(eax, eax);
         c.and_(FLAGS, ~decltype(Flags::fz)::mask);
@@ -2832,7 +2941,7 @@ public:
     void mul_y0(Mul2 op, MemImm8 x, Ax a) {
         const Reg64 x0 = rax;
         const Reg64 address = rbx;
-        c.mov(address, x.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, x.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(x0, address);
         c.rorx(FACTORS, FACTORS, 32);
         c.mov(FACTORS.cvt16(), x0.cvt16());
@@ -2984,7 +3093,7 @@ public:
     }
 
     void StoreToMemory(MemImm8 addr, Reg64 value) {
-        StoreToMemory(addr.Unsigned16() + (blk_key.curr.mod1.page << 8), value);
+        StoreToMemory(addr.Unsigned16() + (block_key.GetMod1().page << 8), value);
     }
 
     template <typename T1, typename T2>
@@ -3075,14 +3184,14 @@ public:
     void mov(MemImm8 a, Ab b) {
         const Reg64 value = rax;
         const Reg64 address = rbx;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         RegFromBus16(b.GetName(), value);
     }
     void mov(MemImm8 a, Ablh b) {
         const Reg64 value = rax;
         const Reg64 address = rbx;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         RegFromBus16(b.GetName(), value);
     }
@@ -3092,14 +3201,14 @@ public:
     void mov(MemImm8 a, RnOld b) {
         const Reg64 value = rax;
         const Reg64 address = rbx;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         RegFromBus16(b.GetName(), value);
     }
     void mov_sv(MemImm8 a) {
         const Reg64 value = rbx;
         const Reg64 address = rax;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         c.mov(word[REGS + offsetof(JitRegisters, sv)], value.cvt16());
     }
@@ -3178,7 +3287,7 @@ public:
     void mov(RnOld a, MemImm8 b) {
         const Reg64 value = rbx;
         RegToBus16(a.GetName(), value);
-        StoreToMemory(b.Unsigned16() + (blk_key.curr.mod1.page << 8), value);
+        StoreToMemory(b.Unsigned16() + (block_key.GetMod1().page << 8), value);
     }
     void mov_icr(Register a) {
         NOT_IMPLEMENTED();
@@ -3234,7 +3343,7 @@ public:
         NOT_IMPLEMENTED();
     }
     void mov_sv_to(MemImm8 b) {
-        StoreToMemory(b.Unsigned16() + (blk_key.curr.mod1.page << 8), word[REGS + offsetof(JitRegisters, sv)]);
+        StoreToMemory(b.Unsigned16() + (block_key.GetMod1().page << 8), word[REGS + offsetof(JitRegisters, sv)]);
     }
     void mov_x0_to(Ab b) {
         NOT_IMPLEMENTED();
@@ -3264,12 +3373,12 @@ public:
     void mov_stepi0(Imm16 a) {
         u16 value = a.Unsigned16();
         c.mov(word[REGS + offsetof(JitRegisters, stepi0)], value);
-        blk_key.stepi0 = value;
+        block_key.GetStepi0() = value;
     }
     void mov_stepj0(Imm16 a) {
         u16 value = a.Unsigned16();
         c.mov(word[REGS + offsetof(JitRegisters, stepj0)], value);
-        blk_key.stepj0 = value;
+        block_key.GetStepj0() = value;
     }
     void mov(Imm16 a, SttMod b) {
         const u16 value = a.Unsigned16();
@@ -3294,10 +3403,10 @@ public:
         compiling = false;
     }
     void mov_stepi0_a0h() {
-        RegFromBus16(RegName::a0h, blk_key.stepi0);
+        RegFromBus16(RegName::a0h, block_key.GetStepi0());
     }
     void mov_stepj0_a0h() {
-        RegFromBus16(RegName::a0h, blk_key.stepj0);
+        RegFromBus16(RegName::a0h, block_key.GetStepj0());
     }
 
     void mov_prpage(Abl a) {
@@ -3550,7 +3659,7 @@ public:
     void movs(MemImm8 a, Ab b) {
         const Reg64 value = rax;
         const Reg64 address = rbx;
-        c.mov(address, a.Unsigned16() + (blk_key.curr.mod1.page << 8));
+        c.mov(address, a.Unsigned16() + (block_key.GetMod1().page << 8));
         EmitLoadFromMemory(value, address);
         SignExtend(value, 16);
         const Reg16 sv = cx;
@@ -4174,49 +4283,49 @@ private:
             regs.GetStt2(c, out.cvt16());
             break;
         case RegName::st0:
-            regs.GetSt0(c, out.cvt16(), blk_key.curr.mod0);
+            regs.GetSt0(c, out.cvt16(), block_key.GetMod0());
             break;
         case RegName::st1:
-            regs.GetSt1(c, out.cvt16(), blk_key.curr.mod0, blk_key.curr.mod1);
+            regs.GetSt1(c, out.cvt16(), block_key.GetMod0(), block_key.GetMod1());
             break;
 
         case RegName::cfgi:
-            c.mov(out, blk_key.cfgi.raw);
+            c.mov(out, block_key.GetCfgi().raw);
             break;
         case RegName::cfgj:
-            c.mov(out, blk_key.cfgj.raw);
+            c.mov(out, block_key.GetCfgj().raw);
             break;
 
         case RegName::mod0:
-            c.mov(out, blk_key.curr.mod0.raw & Mod0::Mask());
+            c.mov(out, block_key.GetMod0().raw & Mod0::Mask());
             break;
         case RegName::mod1:
-            c.mov(out, blk_key.curr.mod1.raw & Mod1::Mask());
+            c.mov(out, block_key.GetMod1().raw & Mod1::Mask());
             break;
         case RegName::mod2:
-            c.mov(out, blk_key.curr.mod2.raw);
+            c.mov(out, block_key.GetMod2().raw);
             break;
         case RegName::mod3:
             regs.GetMod3(c, out);
             break;
 
         case RegName::ar0:
-            c.mov(out, blk_key.curr.ar[0].raw & ArU::Mask());
+            c.mov(out, block_key.GetAr(0).raw & ArU::Mask());
             break;
         case RegName::ar1:
-            c.mov(out, blk_key.curr.ar[1].raw & ArU::Mask());
+            c.mov(out, block_key.GetAr(1).raw & ArU::Mask());
             break;
         case RegName::arp0:
-            c.mov(out, blk_key.curr.arp[0].raw & ArpU::Mask());
+            c.mov(out, block_key.GetArp(0).raw & ArpU::Mask());
             break;
         case RegName::arp1:
-            c.mov(out, blk_key.curr.arp[1].raw & ArpU::Mask());
+            c.mov(out, block_key.GetArp(1).raw & ArpU::Mask());
             break;
         case RegName::arp2:
-            c.mov(out, blk_key.curr.arp[2].raw & ArpU::Mask());
+            c.mov(out, block_key.GetArp(2).raw & ArpU::Mask());
             break;
         case RegName::arp3:
-            c.mov(out, blk_key.curr.arp[3].raw & ArpU::Mask());
+            c.mov(out, block_key.GetArp(3).raw & ArpU::Mask());
             break;
 
         default:
@@ -4345,7 +4454,7 @@ private:
             break;
 
         case RegName::st1:
-            regs.SetSt1(c, value, blk_key.curr.mod0, blk_key.curr.mod1);
+            regs.SetSt1(c, value, block_key.GetMod0(), block_key.GetMod1());
             c.mov(dword[REGS + offsetof(JitRegisters, pc)], regs.pc);
             compiling = false; // Modifies static state, end block
             break;
@@ -4381,7 +4490,7 @@ private:
             break;
 
         case RegName::st0:
-            regs.SetSt0(c, value, blk_key.curr.mod0);
+            regs.SetSt0(c, value, block_key.GetMod0());
             c.mov(dword[REGS + offsetof(JitRegisters, pc)], regs.pc);
             compiling = false; // Static state changed, end block
             break;
@@ -4526,15 +4635,15 @@ private:
             c.mov(word[REGS + offsetof(JitRegisters, sp)], value);
             break;
         case RegName::mod0:
-            blk_key.curr.mod0.raw = value;
+            block_key.GetMod0().raw = value;
             regs.SetMod0(c, value);
             break;
         case RegName::mod1:
-            blk_key.curr.mod1.raw = value;
+            block_key.GetMod1().raw = value;
             regs.SetMod1(c, value);
             break;
         case RegName::mod2:
-            blk_key.curr.mod2.raw = value;
+            block_key.GetMod2().raw = value;
             regs.SetMod2(c, value);
             break;
         case RegName::mod3:
@@ -4542,11 +4651,11 @@ private:
             break;
 
         case RegName::cfgi:
-            blk_key.cfgi.raw = value;
+            block_key.GetCfgi().raw = value;
             regs.SetCfgi(c, value);
             break;
         case RegName::cfgj:
-            blk_key.cfgj.raw = value;
+            block_key.GetCfgj().raw = value;
             regs.SetCfgj(c, value);
             break;
 
@@ -4555,38 +4664,38 @@ private:
             break;
 
         case RegName::st0:
-            regs.SetSt0(c, value, blk_key.curr.mod0);
+            regs.SetSt0(c, value, block_key.GetMod0());
             break;
         case RegName::st1:
-            regs.SetSt1(c, value, blk_key.curr.mod0, blk_key.curr.mod1);
+            regs.SetSt1(c, value, block_key.GetMod0(), block_key.GetMod1());
             break;
         case RegName::st2:
-            regs.SetSt2(c, value, blk_key.curr.mod0, blk_key.curr.mod2);
+            regs.SetSt2(c, value, block_key.GetMod0(), block_key.GetMod2());
             break;
 
         case RegName::ar0:
-            blk_key.curr.ar[0].raw = value;
+            block_key.GetAr(0).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, ar)], value);
             break;
         case RegName::ar1:
-            blk_key.curr.ar[1].raw = value;
+            block_key.GetAr(1).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, ar) + sizeof(u16)], value);
             break;
 
         case RegName::arp0:
-            blk_key.curr.arp[0].raw = value;
+            block_key.GetArp(0).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, arp)], value);
             break;
         case RegName::arp1:
-            blk_key.curr.arp[1].raw = value;
+            block_key.GetArp(1).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, arp) + sizeof(u16)], value);
             break;
         case RegName::arp2:
-            blk_key.curr.arp[2].raw = value;
+            block_key.GetArp(2).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, arp) + sizeof(u16) * 2], value);
             break;
         case RegName::arp3:
-            blk_key.curr.arp[3].raw = value;
+            block_key.GetArp(3).raw = value;
             c.mov(word[REGS + offsetof(JitRegisters, arp) + sizeof(u16) * 3], value);
             break;
 
@@ -4723,7 +4832,7 @@ private:
     template <typename T>
     void SatAndSetAccAndFlag(RegName name, T value) {
         SetAccFlag(value);
-        if (!blk_key.curr.mod0.sata) {
+        if (!block_key.GetMod0().sata) {
             SaturateAcc<true>(value);
         }
         SetAcc(name, value);
@@ -4736,14 +4845,14 @@ private:
 
     void GetAndSatAcc(Reg64 out, RegName name) {
         GetAcc(out, name);
-        if (!blk_key.curr.mod0.sat) {
+        if (!block_key.GetMod0().sat) {
             SaturateAcc<true>(out);
         }
     }
 
     void GetAndSatAccNoFlag(Reg64 out, RegName name) {
         GetAcc(out, name);
-        if (!blk_key.curr.mod0.sat) {
+        if (!block_key.GetMod0().sat) {
             SaturateAcc<false>(out);
         }
     }
@@ -4755,7 +4864,7 @@ private:
         c.xor_(rsi, rsi);
         c.mov(esi, dword[REGS + offsetof(JitRegisters, p) + sizeof(u32) * unit]);
         c.or_(value, rsi);
-        switch (unit == 0 ? blk_key.curr.mod0.ps0.Value() : blk_key.curr.mod0.ps1.Value()) {
+        switch (unit == 0 ? block_key.GetMod0().ps0.Value() : block_key.GetMod0().ps1.Value()) {
         case 0:
             SignExtend(value, 33);
             break;
@@ -4775,7 +4884,7 @@ private:
     }
 
     void RnAddress(u32 unit, Reg64 value) {
-        if (blk_key.curr.mod2.IsBr(unit) && !blk_key.curr.mod2.IsM(unit)) {
+        if (block_key.GetMod2().IsBr(unit) && !block_key.GetMod2().IsM(unit)) {
             c.rol(value.cvt16(), 8);
             c.mov(esi, value.cvt32());
             c.and_(esi, 3855);
@@ -4811,8 +4920,8 @@ private:
             c.sub(address, 1);
             return;
         }
-        const bool emod = blk_key.curr.mod2.IsM(unit) && !blk_key.curr.mod2.IsBr(unit) && !dmod;
-        u16 mod = unit < 4 ? blk_key.cfgi.mod : blk_key.cfgj.mod;
+        const bool emod = block_key.GetMod2().IsM(unit) && !block_key.GetMod2().IsBr(unit) && !dmod;
+        u16 mod = unit < 4 ? block_key.GetCfgi().mod : block_key.GetCfgj().mod;
         [[maybe_unused]] u16 mask = 1; // mod = 0 still have one bit mask
         for (u32 i = 0; i < 9; ++i) {
             mask |= mod >> i;
@@ -4858,7 +4967,7 @@ private:
 
     void StepAddress(u32 unit, Reg16 address, StepValue step, bool dmod = false) {
         u16 s;
-        bool legacy = blk_key.curr.mod1.cmd;
+        bool legacy = block_key.GetMod1().cmd;
         bool step2_mode1 = false;
         bool step2_mode2 = false;
         switch (step) {
@@ -4890,15 +4999,15 @@ private:
             step2_mode2 = !legacy;
             break;
         case StepValue::PlusStep: {
-            if (blk_key.curr.mod2.IsBr(unit) && !blk_key.curr.mod2.IsM(unit)) {
-                s = unit < 4 ? blk_key.stepi0 : blk_key.stepj0;
+            if (block_key.GetMod2().IsBr(unit) && !block_key.GetMod2().IsM(unit)) {
+                s = unit < 4 ? block_key.GetStepi0() : block_key.GetStepj0();
             } else {
-                s = unit < 4 ? blk_key.cfgi.step : blk_key.cfgj.step;
+                s = unit < 4 ? block_key.GetCfgi().step : block_key.GetCfgj().step;
                 s = ::SignExtend<7>(s);
             }
-            if (blk_key.curr.mod1.stp16 == 1 && !legacy) {
+            if (block_key.GetMod1().stp16 == 1 && !legacy) {
                 s = unit < 4 ? regs.stepi0 : regs.stepj0;
-                if (blk_key.curr.mod2.IsM(unit)) {
+                if (block_key.GetMod2().IsM(unit)) {
                     s = ::SignExtend<9>(s);
                 }
             }
@@ -4910,8 +5019,8 @@ private:
 
         if (s == 0)
             return;
-        if (!dmod && !blk_key.curr.mod2.IsBr(unit) && blk_key.curr.mod2.IsM(unit)) {
-            u16 mod = unit < 4 ? blk_key.cfgi.mod : blk_key.cfgj.mod;
+        if (!dmod && !block_key.GetMod2().IsBr(unit) && block_key.GetMod2().IsM(unit)) {
+            u16 mod = unit < 4 ? block_key.GetCfgi().mod : block_key.GetCfgj().mod;
 
             if (mod == 0) {
                 return;
@@ -5009,7 +5118,7 @@ private:
     }
 
     void RnAndModifyNoPreserve(u32 unit, StepValue step, Reg64 out, bool dmod = false) {
-        if ((unit == 3 && blk_key.curr.mod1.epi) || (unit == 7 && blk_key.curr.mod1.epj)) {
+        if ((unit == 3 && block_key.GetMod1().epi) || (unit == 7 && block_key.GetMod1().epj)) {
             if (step != StepValue::Increase2Mode1 && step != StepValue::Decrease2Mode1 &&
                 step != StepValue::Increase2Mode2 && step != StepValue::Decrease2Mode2) {
                 switch (unit) {
@@ -5136,7 +5245,7 @@ private:
             UNREACHABLE();
         }
 
-        if ((unit == 3 && blk_key.curr.mod1.epi) || (unit == 7 && blk_key.curr.mod1.epj)) {
+        if ((unit == 3 && block_key.GetMod1().epi) || (unit == 7 && block_key.GetMod1().epj)) {
             if (step != StepValue::Increase2Mode1 && step != StepValue::Decrease2Mode1 &&
                 step != StepValue::Increase2Mode2 && step != StepValue::Decrease2Mode2) {
                 switch (unit) {
@@ -5224,17 +5333,17 @@ private:
     }
 
     template <typename ArRnX>
-    u16 GetArRnUnit(ArRnX arrn) const {
+    u16 GetArRnUnit(ArRnX arrn) {
         static_assert(std::is_same_v<ArRnX, ArRn1> || std::is_same_v<ArRnX, ArRn2>);
         switch (arrn.Index()) {
         case 0:
-            return blk_key.curr.ar[0].arrn0.Value();
+            return block_key.GetAr(0).arrn0.Value();
         case 1:
-            return blk_key.curr.ar[0].arrn1.Value();
+            return block_key.GetAr(0).arrn1.Value();
         case 2:
-            return blk_key.curr.ar[1].arrn0.Value();
+            return block_key.GetAr(1).arrn0.Value();
         case 3:
-            return blk_key.curr.ar[1].arrn1.Value();
+            return block_key.GetAr(1).arrn1.Value();
         default:
             UNREACHABLE();
         }
@@ -5264,19 +5373,19 @@ private:
     }
 
     template <typename ArStepX>
-    StepValue GetArStep(ArStepX arstep) const {
+    StepValue GetArStep(ArStepX arstep) {
         static_assert(std::is_same_v<ArStepX, ArStep1> || std::is_same_v<ArStepX, ArStep1Alt> ||
                       std::is_same_v<ArStepX, ArStep2>);
         const u16 value = [&] {
             switch (arstep.Index()) {
             case 0:
-                return blk_key.curr.ar[0].arstep0.Value();
+                return block_key.GetAr(0).arstep0.Value();
             case 1:
-                return blk_key.curr.ar[0].arstep1.Value();
+                return block_key.GetAr(0).arstep1.Value();
             case 2:
-                return blk_key.curr.ar[1].arstep0.Value();
+                return block_key.GetAr(1).arstep0.Value();
             case 3:
-                return blk_key.curr.ar[1].arstep1.Value();
+                return block_key.GetAr(1).arstep1.Value();
             default:
                 UNREACHABLE();
             }
@@ -5285,38 +5394,38 @@ private:
     }
 
     template <typename ArpStepX>
-    std::tuple<OffsetValue, OffsetValue> GetArpOffset(ArpStepX arpstepi, ArpStepX arpstepj) const {
+    std::tuple<OffsetValue, OffsetValue> GetArpOffset(ArpStepX arpstepi, ArpStepX arpstepj) {
         static_assert(std::is_same_v<ArpStepX, ArpStep1> || std::is_same_v<ArpStepX, ArpStep2>);
-        return std::make_tuple((OffsetValue)blk_key.curr.arp[arpstepi.Index()].arpoffseti.Value(),
-                               (OffsetValue)blk_key.curr.arp[arpstepj.Index()].arpoffsetj.Value());
+        return std::make_tuple((OffsetValue)block_key.GetArp(arpstepi.Index()).arpoffseti.Value(),
+                               (OffsetValue)block_key.GetArp(arpstepj.Index()).arpoffsetj.Value());
     }
 
     template <typename ArpRnX>
-    std::tuple<u16, u16> GetArpRnUnit(ArpRnX arprn) const {
+    std::tuple<u16, u16> GetArpRnUnit(ArpRnX arprn) {
         static_assert(std::is_same_v<ArpRnX, ArpRn1> || std::is_same_v<ArpRnX, ArpRn2>);
-        return std::make_tuple(blk_key.curr.arp[arprn.Index()].arprni, blk_key.curr.arp[arprn.Index()].arprnj + 4);
+        return std::make_tuple(block_key.GetArp(arprn.Index()).arprni, block_key.GetArp(arprn.Index()).arprnj + 4);
     }
 
     template <typename ArpStepX>
-    std::tuple<StepValue, StepValue> GetArpStep(ArpStepX arpstepi, ArpStepX arpstepj) const {
+    std::tuple<StepValue, StepValue> GetArpStep(ArpStepX arpstepi, ArpStepX arpstepj) {
         static_assert(std::is_same_v<ArpStepX, ArpStep1> || std::is_same_v<ArpStepX, ArpStep2>);
-        return std::make_tuple(ConvertArStep(blk_key.curr.arp[arpstepi.Index()].arpstepi),
-                               ConvertArStep(blk_key.curr.arp[arpstepj.Index()].arpstepj));
+        return std::make_tuple(ConvertArStep(block_key.GetArp(arpstepi.Index()).arpstepi),
+                               ConvertArStep(block_key.GetArp(arpstepj.Index()).arpstepj));
     }
 
     template <typename ArStepX>
-    OffsetValue GetArOffset(ArStepX arstep) const {
+    OffsetValue GetArOffset(ArStepX arstep) {
         static_assert(std::is_same_v<ArStepX, ArStep1> || std::is_same_v<ArStepX, ArStep2>);
         const u16 value = [&] {
             switch (arstep.Index()) {
             case 0:
-                return blk_key.curr.ar[0].aroffset0.Value();
+                return block_key.GetAr(0).aroffset0.Value();
             case 1:
-                return blk_key.curr.ar[0].aroffset1.Value();
+                return block_key.GetAr(0).aroffset1.Value();
             case 2:
-                return blk_key.curr.ar[1].aroffset0.Value();
+                return block_key.GetAr(1).aroffset0.Value();
             case 3:
-                return blk_key.curr.ar[1].aroffset1.Value();
+                return block_key.GetAr(1).aroffset1.Value();
             default:
                 UNREACHABLE();
             }
